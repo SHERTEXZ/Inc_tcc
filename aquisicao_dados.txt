@@ -1,0 +1,129 @@
+#include <Arduino.h>
+#include <math.h> // para log()
+
+// -------------------- Pinos do ESP32 --------------------
+const int NTC_INTERNA = 36;   // VP (ADC1_CH0)
+const int NTC_EXTERNA = 39;   // VN (ADC1_CH3)
+const int ledPin = 2;         // LED builtin no ESP32 (pode variar dependendo da placa)
+
+const int zeroCrossPin = 5;   // D5 - Entrada de zero cross
+const int controlePin = 4;    // D4 - Saída para TRIAC
+
+// -------------------- Parâmetros do divisor de tensão e NTC --------------------
+const float Vcc = 3.3;
+const int Rref = 10000;
+const int ADCMax = 4095;  // ESP32 tem ADC de 12 bits
+
+const float B = 3950.0;
+const float T0_Kelvin = 298.15;  // Kelvin (25°C) - Renomeado para evitar conflito
+const float R0 = 10000.0;
+
+// -------------------- Variáveis do controle --------------------
+volatile bool flag_on = false;
+volatile bool flag_degrau = false;
+
+volatile unsigned long inicio_onda = 0;
+volatile unsigned long ultimaInterrupcao = 0;
+
+unsigned int Tpulso = 6000; // Pulso fixo para Td
+float temperaturaRef = 23.0; // Não usado para controle agora
+
+unsigned long ultimaLeitura = 0;
+unsigned long tempoInicioDegrau = 0; // Para tempo relativo
+const unsigned long intervaloLeitura = 1000000; // 1s em microssegundos
+
+bool cabecalhoImpresso = false;
+float ultimaTempInt = 0;
+float ultimaTempExt = 0;
+
+// -------------------- Leitura de temperatura --------------------
+float lerTemperaturaNTC(int pino, float& ultimaValida) {
+  int adc = analogRead(pino);
+  float V = (adc * Vcc) / ADCMax;
+  if (V >= Vcc) V = Vcc - 0.001;
+
+  float Rntc = (V * Rref) / (Vcc - V);
+  float invT = 1.0 / T0_Kelvin + (1.0 / B) * log(Rntc / R0);
+  float T = (1.0 / invT) - 273.15;
+
+  // Filtro simples para evitar valores inválidos
+  if (isnan(T) || T < -10 || T > 100) {
+    return ultimaValida;
+  }
+  ultimaValida = T;
+  return T;
+}
+
+// -------------------- Interrupção do zero cross --------------------
+void IRAM_ATTR detectZeroCross() {
+  unsigned long agora = micros();
+
+  if ((agora - ultimaInterrupcao > 3000) && flag_degrau) {
+    inicio_onda = agora;
+    flag_on = true;
+    ultimaInterrupcao = agora;
+  }
+}
+
+// -------------------- Pulso para TRIAC --------------------
+void geraPulsoTRIAC() {
+  digitalWrite(controlePin, HIGH);
+  delayMicroseconds(200); // Pulso aumentado para 200us
+  digitalWrite(controlePin, LOW);
+}
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  pinMode(zeroCrossPin, INPUT);
+  pinMode(controlePin, OUTPUT);
+  digitalWrite(controlePin, LOW);
+
+  // Configuração do ADC do ESP32
+  analogReadResolution(12);  // Usar resolução de 12 bits
+  analogSetAttenuation(ADC_11db);  // Faixa de 0-3.3V
+
+  attachInterrupt(digitalPinToInterrupt(zeroCrossPin), detectZeroCross, FALLING);
+}
+
+// -------------------- Loop --------------------
+void loop() {
+  // Habilita o degrau após 5s
+  static bool degrauHabilitado = false;
+  if (!degrauHabilitado && micros() >= 5000000) {
+    flag_degrau = true;
+    degrauHabilitado = true;
+    digitalWrite(ledPin, HIGH);  // Indica que o sistema está ativo
+    tempoInicioDegrau = micros(); // Marca o início para tempo relativo
+  }
+
+  // Leitura e registro a cada 1s
+  if (micros() - ultimaLeitura >= intervaloLeitura) {
+    float tempInt = lerTemperaturaNTC(NTC_INTERNA, ultimaTempInt);
+    float tempExt = lerTemperaturaNTC(NTC_EXTERNA, ultimaTempExt);
+    unsigned long tempoRelativo = micros() - tempoInicioDegrau;
+
+    // Cabeçalho CSV (uma vez)
+    if (!cabecalhoImpresso) {
+      Serial.println("Tempo(us),TempInterna(C),TempExterna(C)");
+      cabecalhoImpresso = true;
+    }
+
+    // Linha de dados CSV
+    Serial.print(tempoRelativo); Serial.print(",");
+    Serial.print(tempInt); Serial.print(",");
+    Serial.println(tempExt);
+
+    ultimaLeitura = micros();  // Atualiza o tempo da última leitura
+  }
+
+  // Disparo TRIAC com atraso fixo
+  if (flag_degrau && flag_on && (micros() - inicio_onda >= Tpulso)) {
+    geraPulsoTRIAC();
+    flag_on = false;
+  }
+}
